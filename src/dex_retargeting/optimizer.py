@@ -1,5 +1,5 @@
 from abc import abstractmethod
-from typing import List, Optional
+from typing import List, Mapping, Optional
 
 import nlopt
 import numpy as np
@@ -329,6 +329,8 @@ class DexPilotOptimizer(Optimizer):
     """
 
     retargeting_type = "DEXPILOT"
+    # Soft-pose objective coefficient in loss units per radian squared.
+    fist_tight_q_weight = 0.05
 
     def __init__(
         self,
@@ -369,6 +371,7 @@ class DexPilotOptimizer(Optimizer):
         super().__init__(robot, target_joint_names, target_link_human_indices)
         self.origin_link_names = target_origin_link_names
         self.task_link_names = target_task_link_names
+        self.finger_tip_link_names = list(finger_tip_link_names)
         self.scaling = scaling
         self.huber_loss = torch.nn.SmoothL1Loss(beta=huber_delta, reduction="none")
         self.norm_delta = norm_delta
@@ -403,6 +406,131 @@ class DexPilotOptimizer(Optimizer):
             self.s2_project_index_task,
             self.projected_dist,
         ) = self.set_dexpilot_cache(self.num_fingers, eta1, eta2)
+        self.calibration_pair_targets = None
+        self.calibration_pair_coefficients = None
+        self.calibration_pinch_mask = np.ones(self.num_fingers - 1, dtype=bool)
+        self.calibration_fist_targets = None
+        self.calibration_fist_coefficients = None
+        self.calibration_fist_activation = 0.0
+        self.calibration_fist_tip_indices = None
+        self.calibration_fist_proximal_indices = None
+        self.calibration_tight_joint_indices = None
+        self.calibration_tight_joint_targets = None
+
+    def set_calibration_fist_links(self, proximal_link_names: List[str]):
+        """Add the five proximal links needed by the optional fist objective."""
+        if self.num_fingers != 5 or len(proximal_link_names) != 5:
+            raise ValueError("Calibrated fist targets require five proximal links")
+        if len(set(proximal_link_names)) != 5:
+            raise ValueError("Calibrated fist proximal links must be independent")
+        for name in proximal_link_names:
+            self.robot.get_link_index(name)
+            if name not in self.computed_link_names:
+                self.computed_link_names.append(name)
+        self.computed_link_indices = self.get_link_indices(self.computed_link_names)
+        self.calibration_fist_tip_indices = torch.tensor(
+            [self.computed_link_names.index(name) for name in self.finger_tip_link_names]
+        )
+        self.calibration_fist_proximal_indices = torch.tensor(
+            [self.computed_link_names.index(name) for name in proximal_link_names]
+        )
+
+    def set_calibration_fist_targets(
+        self,
+        targets: np.ndarray,
+        weights: np.ndarray,
+        activation: float,
+    ):
+        """Set optional proximal-to-tip targets and fist activation for one frame."""
+        targets = np.asarray(targets, dtype=np.float64)
+        weights = np.asarray(weights, dtype=np.float64)
+        activation = float(activation)
+        if targets.shape != (5, 3) or weights.shape != (5,):
+            raise ValueError("Calibrated fist targets/weights must have shapes (5, 3)/(5,)")
+        if not np.isfinite(targets).all() or not np.isfinite(weights).all():
+            raise ValueError("Calibrated fist targets must be finite")
+        if np.any(weights < 0.0) or not 0.0 <= activation <= 1.0:
+            raise ValueError("Calibrated fist weights/activation are out of range")
+        if self.calibration_fist_tip_indices is None:
+            raise ValueError("Calibrated fist links must be configured before targets")
+        coefficients = weights * activation
+        # Keep the thumb under the native retargeting objective during fist assistance.
+        coefficients[0] = 0.0
+        self.calibration_fist_activation = activation
+        self.calibration_fist_targets = targets if np.any(coefficients) else None
+        self.calibration_fist_coefficients = (
+            coefficients if self.calibration_fist_targets is not None else None
+        )
+
+    def set_calibration_tight_joint_targets(
+        self, joint_positions: Mapping[str, Mapping[str, float]]
+    ):
+        """Set collision-solved four-finger source-joint targets in radians."""
+        fingers = ("index", "middle", "ring", "pinky")
+        if not isinstance(joint_positions, Mapping) or set(joint_positions) != set(
+            fingers
+        ):
+            raise ValueError("Tight joint targets must define four non-thumb fingers")
+        if any(
+            not isinstance(joint_positions[finger], Mapping)
+            or not joint_positions[finger]
+            for finger in fingers
+        ):
+            raise ValueError("Tight source joints must be non-empty and independent")
+        flat = [
+            (name, value)
+            for finger in fingers
+            for name, value in joint_positions[finger].items()
+        ]
+        if len({name for name, _ in flat}) != len(flat):
+            raise ValueError("Tight source joints must be non-empty and independent")
+        unknown = {name for name, _ in flat} - set(self.target_joint_names)
+        if unknown:
+            raise ValueError(f"Tight joint targets are not optimized joints: {sorted(unknown)}")
+        values = np.asarray([value for _, value in flat], dtype=np.float64)
+        if not np.isfinite(values).all():
+            raise ValueError("Tight joint targets must be finite")
+        self.calibration_tight_joint_indices = np.asarray(
+            [self.target_joint_names.index(name) for name, _ in flat], dtype=int
+        )
+        self.calibration_tight_joint_targets = values
+
+    def set_calibration_pinch_mask(self, enabled: np.ndarray):
+        """Gate both native projections and the optional calibrated pair loss."""
+        enabled = np.asarray(enabled)
+        if enabled.shape != (self.num_fingers - 1,) or enabled.dtype != np.bool_:
+            raise ValueError("Pinch mask must contain one boolean per non-thumb finger")
+        self.calibration_pinch_mask = enabled.copy()
+        self.calibration_pair_targets = None
+        self.calibration_pair_coefficients = None
+
+    def set_calibration_pinch_targets(
+        self,
+        targets: np.ndarray,
+        weights: np.ndarray,
+        activations: np.ndarray,
+    ):
+        """Set optional thumb-to-finger targets for the next optimization."""
+        targets = np.asarray(targets, dtype=np.float64)
+        weights = np.asarray(weights, dtype=np.float64)
+        activations = np.asarray(activations, dtype=np.float64)
+        if self.num_fingers != 5 or targets.shape != (4, 3):
+            raise ValueError("Calibrated pinch targets require a five-finger (4, 3) target")
+        if weights.shape != (4,) or activations.shape != (4,):
+            raise ValueError("Calibrated pinch weights and activations must have shape (4,)")
+        if not all(np.isfinite(value).all() for value in (targets, weights, activations)):
+            raise ValueError("Calibrated pinch targets must be finite")
+        if np.any(weights < 0.0) or np.any((activations < 0.0) | (activations > 1.0)):
+            raise ValueError("Calibrated pinch weights/activations are out of range")
+
+        coefficients = (
+            weights * activations * self.calibration_pinch_mask
+            * (1.0 - self.calibration_fist_activation)
+        )
+        self.calibration_pair_targets = targets if np.any(coefficients) else None
+        self.calibration_pair_coefficients = (
+            coefficients if self.calibration_pair_targets is not None else None
+        )
 
     @staticmethod
     def generate_link_indices(num_fingers):
@@ -467,6 +595,7 @@ class DexPilotOptimizer(Optimizer):
         target_vec_dist = np.linalg.norm(target_vector[:len_proj], axis=1)
         self.projected[:len_s1][target_vec_dist[0:len_s1] < self.project_dist] = True
         self.projected[:len_s1][target_vec_dist[0:len_s1] > self.escape_dist] = False
+        self.projected[:len_s1] &= self.calibration_pinch_mask
         self.projected[len_s1:len_proj] = np.logical_and(
             self.projected[:len_s1][self.s2_project_index_origin],
             self.projected[:len_s1][self.s2_project_index_task],
@@ -479,6 +608,9 @@ class DexPilotOptimizer(Optimizer):
         normal_weight = np.ones(len_proj, dtype=np.float32) * 1
         high_weight = np.array([200] * len_s1 + [400] * len_s2, dtype=np.float32)
         weight = np.where(self.projected, high_weight, normal_weight)
+        fist_activation = self.calibration_fist_activation
+        if fist_activation > 0.0:
+            weight = (1.0 - fist_activation) * weight + fist_activation * normal_weight
 
         # We change the weight to 10 instead of 1 here, for vector originate from wrist to fingertips
         # This ensures better intuitive mapping due wrong pose detection
@@ -501,11 +633,36 @@ class DexPilotOptimizer(Optimizer):
         reference_vec = np.where(
             self.projected[:, None], projected_vec, normal_vec[:len_proj]
         )  # (6, 3)
+        if fist_activation > 0.0:
+            reference_vec = (
+                (1.0 - fist_activation) * reference_vec
+                + fist_activation * normal_vec[:len_proj]
+            )
         reference_vec = np.concatenate(
             [reference_vec, normal_vec[len_proj:]], axis=0
         )  # (10, 3)
         torch_target_vec = torch.as_tensor(reference_vec, dtype=torch.float32)
         torch_target_vec.requires_grad_(False)
+        if self.calibration_pair_targets is None:
+            torch_pair_targets = None
+            torch_pair_coefficients = None
+        else:
+            torch_pair_targets = torch.as_tensor(self.calibration_pair_targets)
+            torch_pair_coefficients = torch.as_tensor(
+                self.calibration_pair_coefficients
+            )
+        if self.calibration_fist_targets is None:
+            torch_fist_targets = None
+            torch_fist_coefficients = None
+        else:
+            torch_fist_targets = torch.as_tensor(self.calibration_fist_targets)
+            torch_fist_coefficients = torch.as_tensor(
+                self.calibration_fist_coefficients
+            )
+        tight_q_active = (
+            self.calibration_tight_joint_indices is not None
+            and fist_activation > 0.0
+        )
 
         def objective(x: np.ndarray, grad: np.ndarray) -> float:
             qpos[self.idx_pin2target] = x
@@ -537,8 +694,41 @@ class DexPilotOptimizer(Optimizer):
                 * weight
                 / (robot_vec.shape[0])
             ).sum()
+            if torch_pair_targets is not None:
+                robot_pair_vec = -robot_vec[:4]
+                pair_dist = torch.norm(
+                    robot_pair_vec - torch_pair_targets, dim=1, keepdim=False
+                )
+                huber_distance += (
+                    self.huber_loss(pair_dist, torch.zeros_like(pair_dist))
+                    * torch_pair_coefficients
+                ).sum()
+            if torch_fist_targets is not None:
+                tip_pos = torch_body_pos[self.calibration_fist_tip_indices, :]
+                proximal_pos = torch_body_pos[
+                    self.calibration_fist_proximal_indices, :
+                ]
+                fist_dist = torch.norm(
+                    tip_pos - proximal_pos - torch_fist_targets,
+                    dim=1,
+                    keepdim=False,
+                )
+                huber_distance += (
+                    self.huber_loss(fist_dist, torch.zeros_like(fist_dist))
+                    * torch_fist_coefficients
+                ).sum()
             huber_distance = huber_distance.sum()
             result = huber_distance.cpu().detach().item()
+            if tight_q_active:
+                tight_diff = (
+                    x[self.calibration_tight_joint_indices]
+                    - self.calibration_tight_joint_targets
+                )
+                result += (
+                    self.fist_tight_q_weight
+                    * fist_activation
+                    * float(tight_diff @ tight_diff)
+                )
 
             if grad.size > 0:
                 jacobians = []
@@ -569,6 +759,13 @@ class DexPilotOptimizer(Optimizer):
                 # which is equivalent to fully opened the hand
                 # In our implementation, we regularize the joint angles to the previous joint angles
                 grad_qpos += 2 * self.norm_delta * (x - last_qpos)
+                if tight_q_active:
+                    grad_qpos[self.calibration_tight_joint_indices] += (
+                        2.0
+                        * self.fist_tight_q_weight
+                        * fist_activation
+                        * tight_diff
+                    )
 
                 grad[:] = grad_qpos[:]
 
