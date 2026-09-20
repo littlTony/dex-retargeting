@@ -175,7 +175,8 @@ def test_zero_fist_override_preserves_objective_and_gradient():
     np.testing.assert_array_equal(zero_grad, baseline_grad)
 
 
-def test_calibration_fist_gradient_matches_finite_difference():
+@pytest.mark.parametrize("finger_activations", [None, [0.0, 0.4, 0.7, 1.0]])
+def test_calibration_fist_gradient_matches_finite_difference(finger_activations):
     optimizer = _build_five_finger_optimizer()
     target, fixed, qpos = _objective_inputs(optimizer)
     _configure_fist_links(optimizer)
@@ -191,6 +192,7 @@ def test_calibration_fist_gradient_matches_finite_difference():
         ),
         np.array([0.0, 2.0, 4.0, 8.0, 16.0]),
         0.8,
+        finger_activations=finger_activations,
     )
     objective = optimizer.get_objective_function(target, fixed, qpos)
     analytical = np.empty_like(qpos)
@@ -243,11 +245,14 @@ def test_full_fist_activation_disables_calibrated_pinch_pair():
     assert optimizer.calibration_pair_coefficients is None
 
 
-def test_tight_joint_gradient_matches_finite_difference():
+@pytest.mark.parametrize("finger_activations", [None, [0.0, 0.4, 0.7, 1.0]])
+def test_tight_joint_gradient_matches_finite_difference(finger_activations):
     optimizer = _build_five_finger_optimizer()
     target, fixed, qpos = _objective_inputs(optimizer)
     _configure_fist_links(optimizer)
-    optimizer.set_calibration_fist_targets(np.zeros((5, 3)), np.zeros(5), 0.8)
+    optimizer.set_calibration_fist_targets(
+        np.zeros((5, 3)), np.zeros(5), 0.8, finger_activations=finger_activations
+    )
     optimizer.set_calibration_tight_joint_targets(
         _tight_joint_targets(
             {
@@ -288,6 +293,39 @@ def test_tight_joint_target_requires_fist_activation():
 
     assert inactive(qpos, inactive_grad) == baseline_loss
     np.testing.assert_array_equal(inactive_grad, baseline_grad)
+
+
+def test_extended_finger_ignores_tight_target_and_keeps_its_pinch_objective():
+    optimizer = _build_five_finger_optimizer()
+    target, fixed, qpos = _objective_inputs(optimizer)
+    _configure_fist_links(optimizer)
+    optimizer.set_calibration_fist_targets(
+        np.zeros((5, 3)), np.ones(5), 1.0,
+        finger_activations=np.array([0.0, 1.0, 1.0, 1.0]),
+    )
+    np.testing.assert_array_equal(optimizer.calibration_fist_coefficients, [0, 0, 1, 1, 1])
+    optimizer.set_calibration_pinch_targets(np.zeros((4, 3)), np.ones(4), np.ones(4))
+    np.testing.assert_array_equal(optimizer.calibration_pair_coefficients, [1, 0, 0, 0])
+    optimizer.set_calibration_tight_joint_targets(_tight_joint_targets())
+    objective = optimizer.get_objective_function(target, fixed, qpos)
+    baseline_grad = np.empty_like(qpos)
+    baseline_loss = objective(qpos, baseline_grad)
+
+    optimizer.set_calibration_tight_joint_targets(_tight_joint_targets({"FFJ3": 1.5}))
+    objective = optimizer.get_objective_function(target, fixed, qpos)
+    changed_grad = np.empty_like(qpos)
+    assert objective(qpos, changed_grad) == baseline_loss
+    np.testing.assert_array_equal(changed_grad, baseline_grad)
+
+
+@pytest.mark.parametrize("amounts", [[0.0], [np.nan] * 4, [-0.1] * 4, [1.1] * 4])
+def test_invalid_finger_fist_activations_are_rejected(amounts):
+    optimizer = _build_five_finger_optimizer()
+    _configure_fist_links(optimizer)
+    with pytest.raises(ValueError, match="Finger fist activations"):
+        optimizer.set_calibration_fist_targets(
+            np.zeros((5, 3)), np.ones(5), 1.0, finger_activations=amounts
+        )
 
 
 @pytest.mark.parametrize(("joint", "value"), (("missing_joint", 0.0), ("FFJ3", np.nan)))
